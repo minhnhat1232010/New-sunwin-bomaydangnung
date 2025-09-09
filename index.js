@@ -5,7 +5,19 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- fetch data from source API ---
+// In-memory data store for prediction history and stats
+const predictionHistory = [];
+const stats = {
+    total_predictions: 0,
+    correct_predictions: 0,
+    incorrect_predictions: 0,
+    win_rate: '0.00%',
+    note: "Dữ liệu được lưu trong bộ nhớ tạm (in-memory) và sẽ reset khi server khởi động lại."
+};
+
+const MAX_HISTORY = 100; // Store up to 100 latest predictions
+
+// Function to fetch data from source API
 async function fetchData() {
     try {
         const response = await axios.get('https://ahihidonguoccut-2b5i.onrender.com/mohobomaycai');
@@ -16,9 +28,24 @@ async function fetchData() {
     }
 }
 
+// Function to make the API self-ping to stay active on Render
+function selfPing() {
+    // The public URL of your service will be an environment variable on Render
+    const PING_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+
+    // Ping every 14 minutes (Render's inactivity timeout is 15 minutes)
+    setInterval(async () => {
+        try {
+            await axios.get(PING_URL);
+            console.log('Self-ping successful. API is awake.');
+        } catch (error) {
+            console.error('Self-ping failed:', error.message);
+        }
+    }, 14 * 60 * 1000);
+}
+
 // --- Main predict function (entry) ---
 function predict(data) {
-    // Expect data.Lich_su_phien (array of {Phien, Ket_qua}) OR fallback use other fields if single session
     const historyRecords = Array.isArray(data.Lich_su_phien) ? data.Lich_su_phien : (data.history || []);
     const history = historyRecords.map(h => (h.Ket_qua || h.ket_qua || h.result || '').trim());
 
@@ -31,14 +58,10 @@ function predict(data) {
         };
     }
 
-    // Deterministic: extract last 20 for short-term and last 50 (or all) for long-term
     const last20 = history.slice(-20);
     const last50 = history.slice(-50);
-
-    // Generate 20 deterministic pattern samples from history
     const patternSamples = generatePatternSamplesDeterministic(history, 20);
 
-    // Define models (each returns { prediction, explanation })
     const models = [
         { name: 'Model 1: Pattern Analysis', func: model1PatternAnalysis },
         { name: 'Model 2: Rolling Frequency', func: model2FrequencyAnalysis },
@@ -50,7 +73,6 @@ function predict(data) {
     const allPredictions = [];
     const explanations = [];
 
-    // Run ensemble: each model on short-term and long-term (deterministic)
     models.forEach((model, idx) => {
         const shortPred = model.func(last20.slice(), patternSamples, `${idx+1}-S`);
         const longPred = model.func(last50.length >= 20 ? last50.slice() : history.slice(), patternSamples, `${idx+1}-L`);
@@ -60,7 +82,6 @@ function predict(data) {
         explanations.push(longPred.explanation);
     });
 
-    // Voting
     const voteTai = allPredictions.filter(p => p === 'Tài').length;
     const voteXiu = allPredictions.filter(p => p === 'Xỉu').length;
     const totalVotes = allPredictions.length;
@@ -69,7 +90,6 @@ function predict(data) {
     else if (voteXiu > voteTai) finalResult = 'Xỉu';
     const confidence = Math.round((Math.max(voteTai, voteXiu) / totalVotes) * 100);
 
-    // Build composite explanation (AI TỔNG HỢP)
     const aiExplanation = buildAiTongHopExplanation({
         finalResult, confidence, voteTai, voteXiu, totalVotes, patternSamples, explanations, history
     });
@@ -83,49 +103,38 @@ function predict(data) {
 }
 
 // ----------------- Deterministic Pattern Sample Generator -----------------
+// (Keep this function as is)
 function generatePatternSamplesDeterministic(fullHistory, sampleCount = 20) {
-    // Build counts of sliding windows of length 3,4,5 (prefer longer)
     const windows = {};
-    for (let n of [5,4,3]) {
+    for (let n of [5, 4, 3]) {
         for (let i = 0; i <= fullHistory.length - n - 1; i++) {
             const key = fullHistory.slice(i, i + n).join('-');
             const next = fullHistory[i + n];
-            if (!windows[key]) windows[key] = { total: 0, nextCounts: { 'Tài':0, 'Xỉu':0 } };
+            if (!windows[key]) windows[key] = { total: 0, nextCounts: { 'Tài': 0, 'Xỉu': 0 } };
             windows[key].total++;
             if (next === 'Tài' || next === 'Xỉu') windows[key].nextCounts[next]++;
         }
     }
-
-    // Convert windows to array, sort by (total * entropy reduction) -> prefer frequent and decisive patterns
     const windowList = Object.entries(windows).map(([pattern, info]) => {
         const taiNext = info.nextCounts['Tài'];
         const xiuNext = info.nextCounts['Xỉu'];
         const decisive = Math.abs(taiNext - xiuNext);
         return { pattern, total: info.total, taiNext, xiuNext, decisive };
-    }).sort((a,b) => (b.total * b.decisive) - (a.total * a.decisive));
-
-    // Build samples deterministically: take top patterns, and also construct complementary types (bệt, 1-1, 2-2, complex)
+    }).sort((a, b) => (b.total * b.decisive) - (a.total * a.decisive));
     const samples = [];
-    // 1) Top explicit patterns
-    for (let i = 0; i < windowList.length && samples.length < Math.floor(sampleCount*0.6); i++) {
+    for (let i = 0; i < windowList.length && samples.length < Math.floor(sampleCount * 0.6); i++) {
         const w = windowList[i];
         const next = w.taiNext >= w.xiuNext ? 'Tài' : 'Xỉu';
         samples.push({ type: 'match', pattern: w.pattern, next });
     }
-
-    // 2) Detect runs (bệt)
     const runs = detectRuns(fullHistory);
-    for (let r of runs.slice(0, Math.floor(sampleCount*0.15))) {
+    for (let r of runs.slice(0, Math.floor(sampleCount * 0.15))) {
         samples.push({ type: 'bệt', pattern: r.pattern, next: r.predNext });
     }
-
-    // 3) Detect alternations (1-1)
     const alternations = detectAlternations(fullHistory);
-    for (let a of alternations.slice(0, Math.floor(sampleCount*0.1))) {
+    for (let a of alternations.slice(0, Math.floor(sampleCount * 0.1))) {
         samples.push({ type: '1-1', pattern: a.pattern, next: a.predNext });
     }
-
-    // 4) Add balanced canonical patterns if we still need to fill
     const canonical = [
         { pattern: 'Tài-Xỉu-Tài-Xỉu', next: 'Tài' },
         { pattern: 'Xỉu-Tài-Xỉu-Tài', next: 'Xỉu' },
@@ -141,21 +150,15 @@ function generatePatternSamplesDeterministic(fullHistory, sampleCount = 20) {
         samples.push(Object.assign({ type: 'canonical' }, canonical[ci]));
         ci++;
     }
-
-    // 5) If still less (rare), pad using last20 windows deterministically
     const last20 = fullHistory.slice(-20);
     let idx = 0;
-    while (samples.length < sampleCount && idx < Math.max(1, last20.length-3)) {
-        const pattern = last20.slice(idx, idx+4).join('-');
-        const last = last20[idx+4] || last20[last20.length - 1];
+    while (samples.length < sampleCount && idx < Math.max(1, last20.length - 3)) {
+        const pattern = last20.slice(idx, idx + 4).join('-');
+        const last = last20[idx + 4] || last20[last20.length - 1];
         samples.push({ type: 'pad', pattern, next: (last === 'Tài' ? 'Tài' : 'Xỉu') });
         idx++;
     }
-
-    // Trim to requested sampleCount
     const finalSamples = samples.slice(0, sampleCount);
-
-    // Count Tài/Xỉu next to log
     const taiNextCount = finalSamples.filter(s => s.next === 'Tài').length;
     console.log(`Deterministic samples generated: ${finalSamples.length} (Tài next: ${taiNextCount}, Xỉu next: ${finalSamples.length - taiNextCount})`);
     return finalSamples;
@@ -165,25 +168,23 @@ function detectRuns(history) {
     const runs = [];
     let i = 0;
     while (i < history.length) {
-        let j = i+1;
+        let j = i + 1;
         while (j < history.length && history[j] === history[i]) j++;
         const length = j - i;
         if (length >= 3) {
             const pattern = history.slice(i, j).join('-');
-            const predNext = (history[j] ? history[j] : (history[i] === 'Tài' ? 'Xỉu' : 'Tài')); // deterministic guess: invert next if infinite run end
+            const predNext = (history[j] ? history[j] : (history[i] === 'Tài' ? 'Xỉu' : 'Tài'));
             runs.push({ start: i, length, pattern, predNext });
         }
         i = j;
     }
-    // sort by length desc
-    return runs.sort((a,b) => b.length - a.length);
+    return runs.sort((a, b) => b.length - a.length);
 }
 
 function detectAlternations(history) {
-    // find places with strict alternation of length >=4 (T-X-T-X)
     const alts = [];
     for (let i = 0; i <= history.length - 4; i++) {
-        const seq = history.slice(i, i+4);
+        const seq = history.slice(i, i + 4);
         const isAlt = seq[0] !== seq[1] && seq[0] === seq[2] && seq[1] === seq[3];
         if (isAlt) {
             const pattern = seq.join('-');
@@ -195,44 +196,36 @@ function detectAlternations(history) {
 }
 
 // ----------------- Models -----------------
-
-// Model 1 - Pattern Analysis (detect many bridge types)
+// (Keep all model functions as is)
 function model1PatternAnalysis(data, samples, modelId) {
     const last6 = data.slice(-6).join('-');
-    let prediction = 'Tài'; // default safe
+    let prediction = 'Tài';
     let explanation = '';
-
-    // deterministic checks from highest-specificity patterns to low
-    if (last6.includes('Tài-Xỉu-Tài-Xỉu')) { // 1-1
+    if (last6.includes('Tài-Xỉu-Tài-Xỉu')) {
         prediction = last6.endsWith('Tài') ? 'Xỉu' : 'Tài';
         explanation = `Model ${modelId} (Pattern): Phát hiện 1-1 (so le) trong recent "${last6}". Theo quy luật đảo, dự đoán ${prediction}.`;
-    } else if (last6.includes('Tài-Xỉu-Xỉu-Tài')) { // 1-2-1
+    } else if (last6.includes('Tài-Xỉu-Xỉu-Tài')) {
         prediction = 'Xỉu';
         explanation = `Model ${modelId} (Pattern): Mẫu 1-2-1 trong "${last6}" — dự đoán gãy sang ${prediction}.`;
-    } else if (last6.includes('Xỉu-Tài-Tài-Xỉu')) { // 2-1-2
+    } else if (last6.includes('Xỉu-Tài-Tài-Xỉu')) {
         prediction = 'Tài';
         explanation = `Model ${modelId} (Pattern): Mẫu 2-1-2 => tiếp theo có xu hướng ${prediction}.`;
-    } else if (last6.match(/Tài-Tài-Tài/) || last6.match(/Xỉu-Xỉu-Xỉu/)) { // bệt 3+
-        prediction = data[data.length - 1]; // tiếp tục bệt
+    } else if (last6.match(/Tài-Tài-Tài/) || last6.match(/Xỉu-Xỉu-Xỉu/)) {
+        prediction = data[data.length - 1];
         explanation = `Model ${modelId} (Pattern): Bệt >3 phát hiện trong "${last6}". Mô hình dự báo tiếp tục bệt: ${prediction}, nhưng cảnh báo gãy nếu chuỗi càng dài.`;
-    } else if (last6.match(/Tài-Tài-Xỉu-Xỉu/)) { // 2-2
+    } else if (last6.match(/Tài-Tài-Xỉu-Xỉu/)) {
         prediction = last6.endsWith('Tài') ? 'Xỉu' : 'Tài';
         explanation = `Model ${modelId} (Pattern): Cầu 2-2 trong "${last6}", thông thường đảo sau nhóm: ${prediction}.`;
     } else {
-        // fallback: check samples majority
         const taiCount = samples.filter(s => s.next === 'Tài').length;
-        prediction = taiCount >= samples.length/2 ? 'Tài' : 'Xỉu';
+        prediction = taiCount >= samples.length / 2 ? 'Tài' : 'Xỉu';
         explanation = `Model ${modelId} (Pattern): Không match cầu cụ thể trong "${last6}". Dựa vào ${samples.length} mẫu, ${taiCount} mẫu lead đến Tài => dự đoán ${prediction}.`;
     }
-
-    // Add sample support %
     const sampleTaiPct = Math.round(samples.filter(s => s.next === 'Tài').length / samples.length * 100);
     explanation += ` Hỗ trợ từ mẫu: ${sampleTaiPct}% dẫn tới Tài.`;
-
     return { prediction, explanation };
 }
 
-// Model 2 - Rolling Frequency
 function model2FrequencyAnalysis(data, samples, modelId) {
     if (!data.length) return { prediction: 'Tài', explanation: `Model ${modelId} (Frequency): Không có dữ liệu.` };
     const total = data.length;
@@ -240,9 +233,6 @@ function model2FrequencyAnalysis(data, samples, modelId) {
     const pctTai = Math.round(taiCount / total * 100);
     let prediction;
     let explanation = `Model ${modelId} (Frequency): Trong ${total} phiên gần nhất, Tài = ${pctTai}%. `;
-
-    // deterministic balancing logic: if heavily skewed -> predict opposite (cân bằng),
-    // if balanced -> predict according to slight trend
     if (pctTai >= 70) {
         prediction = 'Xỉu';
         explanation += `Tỷ lệ Tài >=70% → kỳ vọng cân bằng sang Xỉu.`;
@@ -250,51 +240,45 @@ function model2FrequencyAnalysis(data, samples, modelId) {
         prediction = 'Tài';
         explanation += `Tỷ lệ Tài <=30% → kỳ vọng bù về Tài.`;
     } else {
-        // small bias: if pctTai>50 then slightly favor continuation but we use balancing heuristic
         prediction = pctTai > 55 ? 'Xỉu' : (pctTai < 45 ? 'Tài' : (pctTai >= 50 ? 'Tài' : 'Xỉu'));
         explanation += `Tỷ lệ trung gian → dùng heuristic cân bằng/tiếp tục: dự đoán ${prediction}.`;
     }
-
     const sampleTaiPct = Math.round(samples.filter(s => s.next === 'Tài').length / samples.length * 100);
     explanation += ` Mẫu hỗ trợ: ${sampleTaiPct}% dẫn đến Tài.`;
     return { prediction, explanation };
 }
 
-// Model 3 - Markov Chain
 function model3MarkovChain(data, samples, modelId) {
     if (data.length < 2) {
         return { prediction: 'Tài', explanation: `Model ${modelId} (Markov): Không đủ dữ liệu để tính ma trận chuyển trạng thái.` };
     }
-    let TT=0, TX=0, XT=0, XX=0;
-    for (let i=0;i<data.length-1;i++){
+    let TT = 0, TX = 0, XT = 0, XX = 0;
+    for (let i = 0; i < data.length - 1; i++) {
         if (data[i] === 'Tài') {
-            if (data[i+1] === 'Tài') TT++; else TX++;
+            if (data[i + 1] === 'Tài') TT++; else TX++;
         } else {
-            if (data[i+1] === 'Xỉu') XX++; else XT++;
+            if (data[i + 1] === 'Xỉu') XX++; else XT++;
         }
     }
     const pTT = TT + TX > 0 ? TT / (TT + TX) : 0.5;
     const pXX = XX + XT > 0 ? XX / (XX + XT) : 0.5;
-    const last = data[data.length-1];
+    const last = data[data.length - 1];
     let prediction = last === 'Tài' ? (pTT >= 0.5 ? 'Tài' : 'Xỉu') : (pXX >= 0.5 ? 'Xỉu' : 'Tài');
-    const explanation = `Model ${modelId} (Markov): P(T→T)=${Math.round(pTT*100)}%, P(X→X)=${Math.round(pXX*100)}%. Kết quả hiện tại "${last}" → dự đoán ${prediction}.`;
+    const explanation = `Model ${modelId} (Markov): P(T→T)=${Math.round(pTT * 100)}%, P(X→X)=${Math.round(pXX * 100)}%. Kết quả hiện tại "${last}" → dự đoán ${prediction}.`;
     return { prediction, explanation };
 }
 
-// Model 4 - N-gram Matching (4-gram primary, fallback 3-gram)
 function model4NgramMatching(data, samples, modelId) {
-    const n = Math.min(4, Math.max(3, data.length - 1)); // use up to 4
+    const n = Math.min(4, Math.max(3, data.length - 1));
     const lastN = data.slice(-n).join('-');
-    // Build n-gram map from data
     const ngramMap = {};
-    for (let i=0;i<=data.length - n - 1;i++) {
-        const key = data.slice(i, i+n).join('-');
-        const next = data[i+n];
-        if (!ngramMap[key]) ngramMap[key] = { Tài:0, Xỉu:0, total:0 };
+    for (let i = 0; i <= data.length - n - 1; i++) {
+        const key = data.slice(i, i + n).join('-');
+        const next = data[i + n];
+        if (!ngramMap[key]) ngramMap[key] = { Tài: 0, Xỉu: 0, total: 0 };
         ngramMap[key][next] = (ngramMap[key][next] || 0) + 1;
         ngramMap[key].total++;
     }
-
     let prediction = 'Tài';
     let explanation = `Model ${modelId} (N-gram): So khớp chuỗi length ${n} "${lastN}". `;
     if (ngramMap[lastN]) {
@@ -302,106 +286,107 @@ function model4NgramMatching(data, samples, modelId) {
         prediction = entry.Tài >= entry.Xỉu ? 'Tài' : 'Xỉu';
         explanation += `Tìm thấy ${entry.total} match: Tài=${entry.Tài}, Xỉu=${entry.Xỉu}. Dự đoán ${prediction}.`;
     } else {
-        // no exact match -> try shorter gram or fallback to sample majority
         const shorter = n > 3 ? data.slice(-3).join('-') : null;
         if (shorter && ngramMap[shorter]) {
             const entry = ngramMap[shorter];
             prediction = entry.Tài >= entry.Xỉu ? 'Tài' : 'Xỉu';
             explanation += `Không match exact, dùng shorter "${shorter}": Tài=${entry.Tài}, Xỉu=${entry.Xỉu} => ${prediction}.`;
         } else {
-            const sampleTai = samples.filter(s=>s.next==='Tài').length;
-            prediction = sampleTai >= samples.length/2 ? 'Tài' : 'Xỉu';
+            const sampleTai = samples.filter(s => s.next === 'Tài').length;
+            prediction = sampleTai >= samples.length / 2 ? 'Tài' : 'Xỉu';
             explanation += `Không có match n-gram. Dùng mẫu: ${sampleTai}/${samples.length} lead Tài => ${prediction}.`;
         }
     }
     return { prediction, explanation };
 }
 
-// Model 5 - Heuristic Weighted (pattern 40%, markov 30%, freq 20%, ngram 10%)
 function model5Heuristic(data, samples, modelId) {
-    // patternScore: fraction of samples that predict Tài
     const patternFraction = samples.filter(s => s.next === 'Tài').length / samples.length;
     const freqFraction = data.filter(x => x === 'Tài').length / data.length;
-
-    // Markov proxy: compute pTT and pXX average to produce a Tài preference metric
-    let TT=0, TX=0, XT=0, XX=0;
-    for (let i=0;i<data.length-1;i++){
+    let TT = 0, TX = 0, XT = 0, XX = 0;
+    for (let i = 0; i < data.length - 1; i++) {
         if (data[i] === 'Tài') {
-            if (data[i+1] === 'Tài') TT++; else TX++;
+            if (data[i + 1] === 'Tài') TT++; else TX++;
         } else {
-            if (data[i+1] === 'Xỉu') XX++; else XT++;
+            if (data[i + 1] === 'Xỉu') XX++; else XT++;
         }
     }
     const pTT = TT + TX > 0 ? TT / (TT + TX) : 0.5;
     const pXX = XX + XT > 0 ? XX / (XX + XT) : 0.5;
-    // markovFavor: positive if markov favors Tài overall
-    const markovFavor = (pTT - (1 - pXX)) / 2 + 0.5; // normalized approx
-
-    // ngram proxy: check last 4-gram support for Tài
+    const markovFavor = (pTT - (1 - pXX)) / 2 + 0.5;
     const last4 = data.slice(-4).join('-');
-    // compute a mini ngram vote
     let ngramFavor = 0.5;
-    for (let i=0;i<=data.length-5;i++){
-        const key = data.slice(i,i+4).join('-');
-        const next = data[i+4];
+    for (let i = 0; i <= data.length - 5; i++) {
+        const key = data.slice(i, i + 4).join('-');
+        const next = data[i + 4];
         if (key === last4) {
             ngramFavor = (next === 'Tài') ? 1 : 0;
             break;
         }
     }
-
     const totalScore = 0.4 * patternFraction + 0.3 * markovFavor + 0.2 * freqFraction + 0.1 * ngramFavor;
     const prediction = totalScore > 0.5 ? 'Tài' : 'Xỉu';
-    const explanation = `Model ${modelId} (Heuristic): Weights => Pattern 40% (${Math.round(patternFraction*100)}%), Markov 30% (${Math.round(markovFavor*100)}%), Freq 20% (${Math.round(freqFraction*100)}%), Ngram 10% (${Math.round(ngramFavor*100)}%). Tổng score Tài: ${Math.round(totalScore*100)}% → Dự đoán ${prediction}.`;
-
+    const explanation = `Model ${modelId} (Heuristic): Weights => Pattern 40% (${Math.round(patternFraction * 100)}%), Markov 30% (${Math.round(markovFavor * 100)}%), Freq 20% (${Math.round(freqFraction * 100)}%), Ngram 10% (${Math.round(ngramFavor * 100)}%). Tổng score Tài: ${Math.round(totalScore * 100)}% → Dự đoán ${prediction}.`;
     return { prediction, explanation };
 }
 
 // ----------------- AI TỔNG HỢP Explanation Builder -----------------
+// (Keep this function as is)
 function buildAiTongHopExplanation({ finalResult, confidence, voteTai, voteXiu, totalVotes, patternSamples, explanations, history }) {
-    // Short header
     let text = `AI TỔNG HỢP: Dự đoán chính là **${finalResult}** (độ tin cậy ${confidence}%). Tổng phiếu: Tài ${voteTai}/${totalVotes}, Xỉu ${voteXiu}/${totalVotes}.\n\n`;
-
-    // Summary of pattern samples
     const taiLead = patternSamples.filter(s => s.next === 'Tài').length;
     text += `Chi tiết mẫu (tổng ${patternSamples.length} mẫu): ${taiLead} mẫu dẫn tới Tài, ${patternSamples.length - taiLead} dẫn tới Xỉu. Những mẫu top giúp hệ thống nhận diện các loại cầu: bệt, 1-1, 2-2, 1-2-1, 2-1-2, 3-1, 1-3, 2-3, 3-2, 4-1, 1-4.\n\n`;
-
-    // Attach model explanations (most load-bearing first: show up to 5-7)
     text += `Giải thích chi tiết từ các model (tóm tắt):\n`;
     explanations.forEach((e, i) => {
-        text += `• AI #${i+1}: ${e}\n`;
+        text += `• AI #${i + 1}: ${e}\n`;
     });
-
-    // Add concrete example reference (last history snippet)
     const lastWindow = history.slice(-10).join('-');
     text += `\nDữ liệu tham chiếu (10 phiên gần nhất): ${lastWindow}.\n`;
-
-    // Final note about limits and recommendation
     text += `\nLưu ý: Mô hình phân tích cầu dựa trên lịch sử — không thể đảm bảo chính xác 100%. Khuyến nghị: kết hợp phân tích AI với quản lý vốn (Kelly hoặc sizing) và chỉ sử dụng kết quả như 1 nguồn tham khảo.\n`;
-
     return text;
 }
 
 // ----------------- Express endpoints -----------------
-app.get('/predict-tai-xiu', async (req, res) => {
+app.get('/conchorerachmangtenthangdangbuapibo', async (req, res) => {
     const rawData = await fetchData();
     if (!rawData) {
         return res.status(500).json({ error: "Failed to fetch data from the source API." });
     }
 
-    // Try to normalize incoming rawData to provide session, dice, total, result
     const session = rawData.Phien || rawData.phien || rawData.session || null;
-    const dice = (rawData.Xuc_xac_1 !== undefined && rawData.Xuc_xac_2 !== undefined && rawData.Xuc_xac_3 !== undefined)
-        ? `${rawData.Xuc_xac_1}-${rawData.Xuc_xac_2}-${rawData.Xuc_xac_3}`
-        : (rawData.Xuc_xac || rawData.dice || null);
     const total = rawData.Tong || rawData.tong || rawData.total || null;
-    const result = rawData.Ket_qua || rawData.ket_qua || rawData.result || null;
+    const result = (rawData.Ket_qua || rawData.ket_qua || rawData.result || '').trim();
 
     const p = predict(rawData);
 
+    // Update in-memory history and stats
+    if (result && p.predict_goc !== 'Không xác định' && session) {
+        stats.total_predictions++;
+        const isCorrect = (p.predict_goc === result);
+        if (isCorrect) {
+            stats.correct_predictions++;
+        } else {
+            stats.incorrect_predictions++;
+        }
+        stats.win_rate = ((stats.correct_predictions / stats.total_predictions) * 100).toFixed(2) + '%';
+
+        predictionHistory.unshift({
+            session: session,
+            prediction: p.predict_goc,
+            actual: result,
+            correct: isCorrect,
+            confidence: p.tin_cay,
+            timestamp: new Date().toISOString()
+        });
+
+        if (predictionHistory.length > MAX_HISTORY) {
+            predictionHistory.pop();
+        }
+    }
+
     const fullResponse = {
         session,
-        dice,
+        dice: (rawData.Xuc_xac_1 !== undefined && rawData.Xuc_xac_2 !== undefined && rawData.Xuc_xac_3 !== undefined) ? `${rawData.Xuc_xac_1}-${rawData.Xuc_xac_2}-${rawData.Xuc_xac_3}` : (rawData.Xuc_xac || rawData.dice || null),
         total,
         result,
         next_session: typeof session === 'number' ? session + 1 : null,
@@ -415,10 +400,24 @@ app.get('/predict-tai-xiu', async (req, res) => {
     res.json(fullResponse);
 });
 
-app.get('/', (req, res) => {
-    res.send('API is running. Use /predict-tai-xiu endpoint to get enhanced predictions (AI TỔNG HỢP).');
+// Endpoint to view prediction history
+app.get('/lichsu-dudoan', (req, res) => {
+    res.json(predictionHistory);
+});
+
+// Endpoint to view statistics
+app.get('/thongke', (req, res) => {
+    res.json(stats);
+});
+
+app.get('/hihianhfreechocacemnekakaka', (req, res) => {
+    res.send('Con Chó Ngu Này Mày Không Làm Mà Đòi Có ăn Hả Chỉ có Bú cu anh mày mới có ăn thôi thằng em ạ bố mày đây nè vào mà bú đi bố share cho mà xài thích lắm đúng không nhưng đời đâu như là mơ các em nhỉ, cứ free là vào bú hả đâu có dễ như em nghĩ đâu đời người mà có làm thì có ăn đéo làm thì cút Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, Hâhhahahahhahahahahahahahhahahahahahahahahhahahahahahahahahhahahahahahahahahahahhahahahahhahahahahahhahahahahhahahah👄👄👄👄👄👄👄👄👦👦🦷🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣🤣, ');
 });
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
+    // Start self-pinging on Render
+    if (process.env.RENDER_EXTERNAL_URL) {
+        selfPing();
+    }
 });
